@@ -24,6 +24,7 @@ module Spree
 
         step :ensure_capturable
         step :ensure_within_payment_amount
+        step :ensure_within_amount_owed
         # Veto point — fraud holds, manual review. Before any money moves.
         run_hooks :validate
         run_hooks :before_capture
@@ -81,10 +82,38 @@ module Spree
         failure(payment, :capture_exceeds_payment_amount)
       end
 
+      # Other payments on the order may have captured some of its total
+      # already; this one may take only what they left owing.
+      def ensure_within_amount_owed
+        owed = payment.amount_owed_by_order(including_in_flight: false)
+        return if owed.nil? || @amount <= owed
+
+        failure(payment, I18n.t('spree.capture_exceeds_amount_owed', amount: Spree::Money.new(owed, currency: payment.currency).to_s))
+      end
+
+      # The owed check again, under the order's row lock and together with
+      # the claim. A payment being charged sits in processing until it is
+      # recorded, and here it counts as taken: of two captures racing on one
+      # order, the second reads after the first has claimed, so both cannot
+      # pass a check made before either moved money.
       def claim
-        halt!(payment) unless payment.started_processing!
+        owed = nil
+        claimed = with_order_lock do
+          owed = payment.amount_owed_by_order(including_in_flight: false, including_processing: true)
+          next :over if owed && @amount > owed
+
+          payment.started_processing!
+        end
+        if claimed == :over
+          failure(payment, I18n.t('spree.capture_exceeds_amount_owed', amount: Spree::Money.new(owed, currency: payment.currency).to_s))
+        end
+        halt!(payment) unless claimed
       rescue Spree::Core::GatewayError => error
         failure(payment, error.message)
+      end
+
+      def with_order_lock(&)
+        payment.order_id ? payment.owner.with_lock(&) : yield
       end
 
       def capture_at_gateway
@@ -127,6 +156,9 @@ module Spree
       # outside the lock.
       def authorize_remainder
         return if remainder.blank?
+        # What the order still owes was captured: holding the rest would only
+        # keep the customer's money tied up.
+        return remainder.void! if remainder.amount_owed_by_order(including_in_flight: true)&.zero?
 
         result = Spree.payment_process_workflow.call(payment: remainder, action: :authorize)
         failure(remainder, result.error.value.to_s) if result.failure?
